@@ -1,0 +1,11 @@
+{
+  "resources": [
+    {"paths": ["art/palette.bin"], "source": "palette.bin"},
+    {
+      "paths": ["scene/root.json"],
+      "source": "root.json",
+      "depends_on": [0],
+      "children": [{"name": "palette", "ref": 0}]
+    }
+  ]
+}
