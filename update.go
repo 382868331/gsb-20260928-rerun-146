@@ -36,9 +36,11 @@ const (
 type UpdateStatus string
 
 const (
-	PreviewDirect  UpdateStatus = "direct"
-	PreviewLocal   UpdateStatus = "local-modified"
-	PreviewRemoved UpdateStatus = "package-deleted"
+	PreviewDirect      UpdateStatus = "direct"
+	PreviewAdded       UpdateStatus = "added"
+	PreviewLocal       UpdateStatus = "local-modified"
+	PreviewUserDeleted UpdateStatus = "user-deleted"
+	PreviewRemoved     UpdateStatus = "package-deleted"
 )
 
 type UpdateChoice string
@@ -234,13 +236,18 @@ func PreviewUpdate(r *Reader, rootDir string) (*UpdatePreview, error) {
 		if hadOld && old.ID == change.ID && localID == change.ID {
 			continue
 		}
-		status := PreviewDirect
+		var status UpdateStatus
 		choice := ChoicePackage
-		if localID != change.ID {
+		switch {
+		case !hadOld && (localID == "" || localID == change.ID):
+			status = PreviewAdded
+		case hadOld && localID == "":
+			status = PreviewUserDeleted
+		case localID == change.ID || (hadOld && localID == old.ID):
+			status = PreviewDirect
+		default:
 			status = PreviewLocal
-			if !hadOld || localID != old.ID {
-				choice = ChoiceKeep
-			}
+			choice = ChoiceKeep
 		}
 		item := UpdateItem{Path: change.Path, Status: status, Kind: change.Type, PackageID: change.ID, LocalID: localID, DefaultChoice: choice, Choice: choice, ReferencedBy: dedupSortedStrings(referrers[change.Path])}
 		if hadOld {
@@ -285,6 +292,9 @@ func DecideUpdate(pv *UpdatePreview, choices map[string]UpdateChoice) error {
 		}
 		if choice != ChoicePackage && choice != ChoiceKeep {
 			return fmt.Errorf("assetpack: invalid choice %q for %q", choice, path)
+		}
+		if choice == ChoiceKeep && item.LocalID == "" {
+			return fmt.Errorf("assetpack: cannot keep %q: no local content exists", path)
 		}
 		item.Choice = choice
 		pv.Choices[path] = choice

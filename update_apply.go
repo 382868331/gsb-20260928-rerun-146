@@ -127,6 +127,9 @@ func PrepareUpdate(r *Reader, rootDir string, pv *UpdatePreview) error {
 		if got != item.LocalID {
 			return fmt.Errorf("%w: %q", ErrPreviewChanged, item.Path)
 		}
+		if item.Choice == ChoiceKeep && item.LocalID == "" {
+			return fmt.Errorf("%w: cannot keep %q: no local content exists", ErrCorrupt, item.Path)
+		}
 	}
 
 	mergedByPath := map[string]Resource{}
