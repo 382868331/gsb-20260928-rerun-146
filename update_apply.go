@@ -149,9 +149,11 @@ func PrepareUpdate(r *Reader, rootDir string, pv *UpdatePreview) error {
 			if item.Choice == ChoiceKeep {
 				op.Action = UpdateKeep
 				op.AfterID = item.LocalID
-				if size, err := localSize(root, name, item.Kind); err != nil {
-					return err
-				} else {
+				if item.LocalID != "" {
+					size, err := localSize(root, name, item.Kind)
+					if err != nil {
+						return err
+					}
 					op.AfterSize = size
 				}
 				op.Source = SourceLocal
@@ -189,9 +191,11 @@ func PrepareUpdate(r *Reader, rootDir string, pv *UpdatePreview) error {
 		if item.Choice == ChoiceKeep {
 			op.Action = UpdateKeep
 			op.AfterID = item.LocalID
-			if size, err := localSize(root, name, item.Kind); err != nil {
-				return err
-			} else {
+			if item.LocalID != "" {
+				size, err := localSize(root, name, item.Kind)
+				if err != nil {
+					return err
+				}
 				op.AfterSize = size
 			}
 			op.Source = SourceLocal
@@ -244,6 +248,11 @@ func buildFinalManifest(r *Reader, inst *installedManifest, installed map[string
 		tipRes, _ := r.Lookup(op.Path)
 		switch op.Action {
 		case UpdateKeep:
+			if op.AfterID == "" {
+				// 保留的是不存在(新增被拒或本地已删除): 清单不得留下空身份记录。
+				delete(records, op.Path)
+				break
+			}
 			if old, ok := installed[op.Path]; ok {
 				old.Source = SourceLocal
 				old.ID = op.AfterID

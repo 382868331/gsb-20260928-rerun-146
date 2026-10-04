@@ -39,6 +39,8 @@ const (
 	PreviewDirect  UpdateStatus = "direct"
 	PreviewLocal   UpdateStatus = "local-modified"
 	PreviewRemoved UpdateStatus = "package-deleted"
+	PreviewNew     UpdateStatus = "new"
+	PreviewMissing UpdateStatus = "user-deleted"
 )
 
 type UpdateChoice string
@@ -236,7 +238,15 @@ func PreviewUpdate(r *Reader, rootDir string) (*UpdatePreview, error) {
 		}
 		status := PreviewDirect
 		choice := ChoicePackage
-		if localID != change.ID {
+		switch {
+		case localID == "" && !hadOld:
+			// 包内新增, 本地与原安装都不存在: 默认采用包内容。
+			status = PreviewNew
+		case localID == "":
+			// 原安装有记录但本地被用户删除: 默认尊重删除, 保持不存在。
+			status = PreviewMissing
+			choice = ChoiceKeep
+		case localID != change.ID:
 			status = PreviewLocal
 			if !hadOld || localID != old.ID {
 				choice = ChoiceKeep
@@ -256,16 +266,28 @@ func PreviewUpdate(r *Reader, rootDir string) (*UpdatePreview, error) {
 
 func impactText(item UpdateItem, deleted bool) string {
 	refs := len(item.ReferencedBy)
-	switch {
-	case item.Choice == ChoiceKeep && deleted:
-		return fmt.Sprintf("保留本地版本；包内已删除，%d 个引用将继续按本地资源解析", refs)
-	case item.Choice == ChoicePackage && deleted:
+	if deleted {
+		if item.Choice == ChoiceKeep {
+			return fmt.Sprintf("保留本地版本；包内已删除，%d 个引用将继续按本地资源解析", refs)
+		}
 		return fmt.Sprintf("采用包内删除；仍引用该路径的 %d 个资源需要改引用，否则关系将缺失", refs)
-	case item.Choice == ChoiceKeep:
-		return fmt.Sprintf("保留本地内容；%d 个引用不会切换到本次包内身份", refs)
-	default:
-		return fmt.Sprintf("采用包内内容；%d 个引用将解析到此次更新身份", refs)
 	}
+	switch item.Status {
+	case PreviewNew:
+		if item.Choice == ChoiceKeep {
+			return "不采用包内新增；本地保持不存在，清单不会记录该资源"
+		}
+		return fmt.Sprintf("采用包内新增内容；%d 个引用将解析到此次更新身份", refs)
+	case PreviewMissing:
+		if item.Choice == ChoiceKeep {
+			return "保留本地删除；该资源保持不存在，清单不再记录它"
+		}
+		return fmt.Sprintf("采用包内内容；恢复本地已删除的资源，%d 个引用将解析到此次更新身份", refs)
+	}
+	if item.Choice == ChoiceKeep {
+		return fmt.Sprintf("保留本地内容；%d 个引用不会切换到本次包内身份", refs)
+	}
+	return fmt.Sprintf("采用包内内容；%d 个引用将解析到此次更新身份", refs)
 }
 
 func DecideUpdate(pv *UpdatePreview, choices map[string]UpdateChoice) error {
