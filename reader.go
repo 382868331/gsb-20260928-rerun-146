@@ -274,6 +274,10 @@ func mergeManifests(base, cur *Manifest) *Manifest {
 		byPath[res.Path] = res
 	}
 	for _, res := range cur.Resources {
+		if res.Type == "removed" {
+			delete(byPath, res.Path)
+			continue
+		}
 		if _, ok := byPath[res.Path]; !ok {
 			order = append(order, res.Path)
 		}
@@ -287,7 +291,9 @@ func mergeManifests(base, cur *Manifest) *Manifest {
 		IndexDigest:  cur.IndexDigest,
 	}
 	for _, p := range order {
-		out.Resources = append(out.Resources, byPath[p])
+		if res, ok := byPath[p]; ok {
+			out.Resources = append(out.Resources, res)
+		}
 	}
 	return out
 }

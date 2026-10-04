@@ -97,6 +97,7 @@ type AddRequest struct {
 	Path      string
 	Data      []byte
 	IsDir     bool
+	Remove    bool     // 增量发布时删除基础包中的同名资源
 	Children  []string // IsDir 时使用, 子项逻辑路径
 	DependsOn []string
 }
@@ -166,6 +167,14 @@ func Build(reqs []AddRequest, opts Options) ([]byte, *Manifest, error) {
 	resources := make([]Resource, 0, len(reqs))
 	for _, req := range reqs {
 		res := Resource{Path: req.Path, Type: "file"}
+		if req.Remove {
+			if !basePaths[req.Path] {
+				return nil, nil, fmt.Errorf("assetpack: remove of unknown resource %q", req.Path)
+			}
+			res.Type = "removed" // 墓碑: 合并包链时删除该资源
+			resources = append(resources, res)
+			continue
+		}
 		var body []byte
 		if req.IsDir {
 			res.Type = "dir"

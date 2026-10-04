@@ -20,6 +20,7 @@ type DepRecord struct {
 	Type      string   `json:"type"`
 	Size      int64    `json:"size"`
 	DependsOn []string `json:"dependsOn"`
+	Origin    string   `json:"origin,omitempty"`
 }
 
 // UnpackResult 汇总解包结果。

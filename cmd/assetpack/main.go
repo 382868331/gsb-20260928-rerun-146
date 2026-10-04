@@ -17,6 +17,7 @@ type SpecEntry struct {
 	File      string   `json:"file,omitempty"`
 	Inline    string   `json:"inline,omitempty"`
 	Dir       bool     `json:"dir,omitempty"`
+	Remove    bool     `json:"remove,omitempty"`
 	Children  []string `json:"children,omitempty"`
 	DependsOn []string `json:"dependsOn,omitempty"`
 }
@@ -35,7 +36,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: pack | unpack | verify")
+		return fmt.Errorf("subcommand required: pack | unpack | verify | preview | apply | rollback")
 	}
 	switch args[0] {
 	case "pack":
@@ -44,6 +45,12 @@ func run(args []string) error {
 		return cmdUnpack(args[1:])
 	case "verify":
 		return cmdVerify(args[1:])
+	case "preview":
+		return cmdPreview(args[1:])
+	case "apply":
+		return cmdApply(args[1:])
+	case "rollback":
+		return cmdRollback(args[1:])
 	default:
 		return fmt.Errorf("unknown subcommand %q", args[0])
 	}
@@ -94,7 +101,11 @@ func cmdPack(args []string) error {
 	}
 	reqs := make([]assetpack.AddRequest, 0, len(sf.Resources))
 	for _, e := range sf.Resources {
-		req := assetpack.AddRequest{Path: e.Path, IsDir: e.Dir, Children: e.Children, DependsOn: e.DependsOn}
+		req := assetpack.AddRequest{Path: e.Path, IsDir: e.Dir, Remove: e.Remove, Children: e.Children, DependsOn: e.DependsOn}
+		if e.Remove {
+			reqs = append(reqs, req)
+			continue
+		}
 		if !e.Dir {
 			switch {
 			case e.File != "":
@@ -197,3 +208,136 @@ type multiFlag []string
 
 func (m *multiFlag) String() string     { return fmt.Sprint([]string(*m)) }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+func cmdPreview(args []string) error {
+	fs := flag.NewFlagSet("preview", flag.ContinueOnError)
+	pkgPath := fs.String("pkg", "", "package path (tip)")
+	dir := fs.String("dir", "", "installation directory")
+	outPath := fs.String("out", "", "write plan JSON for apply -plan")
+	bases := multiFlag{}
+	fs.Var(&bases, "base", "base package, repeat oldest..newest")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *pkgPath == "" || *dir == "" {
+		return fmt.Errorf("-pkg and -dir are required")
+	}
+	r, err := chainFromFlags(*pkgPath, bases)
+	if err != nil {
+		return err
+	}
+	plan, err := assetpack.PreviewUpdate(r, *dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range plan.SortedEntries() {
+		fmt.Printf("%-10s %s", e.Change, e.Path)
+		if e.Decision != "" {
+			fmt.Printf(" -> %s", e.Decision)
+		}
+		if e.ImpactNote != "" {
+			fmt.Printf("  [%s]", e.ImpactNote)
+		}
+		fmt.Println()
+	}
+	if *outPath != "" {
+		b, err := json.MarshalIndent(plan, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := assetpack.WriteFileAtomic(*outPath, b, 0o644); err != nil {
+			return err
+		}
+		fmt.Println("plan written to", *outPath)
+	}
+	return nil
+}
+
+func cmdApply(args []string) error {
+	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
+	pkgPath := fs.String("pkg", "", "package path (tip)")
+	dir := fs.String("dir", "", "installation directory")
+	planPath := fs.String("plan", "", "plan JSON from preview -out")
+	decPath := fs.String("decisions", "", "decisions JSON: path -> pack|keep|remove")
+	resume := fs.Bool("resume", false, "resume an interrupted apply")
+	bases := multiFlag{}
+	fs.Var(&bases, "base", "base package, repeat oldest..newest")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" {
+		return fmt.Errorf("-dir is required")
+	}
+	if *resume {
+		r, err := chainFromFlags(*pkgPath, bases)
+		if err != nil {
+			return err
+		}
+		if err := assetpack.ResumeUpdate(r, *dir); err != nil {
+			return err
+		}
+		fmt.Println("resumed update committed")
+		return nil
+	}
+	if *pkgPath == "" {
+		return fmt.Errorf("-pkg is required")
+	}
+	r, err := chainFromFlags(*pkgPath, bases)
+	if err != nil {
+		return err
+	}
+	var plan *assetpack.UpdatePlan
+	if *planPath != "" {
+		b, err := os.ReadFile(*planPath)
+		if err != nil {
+			return err
+		}
+		var p assetpack.UpdatePlan
+		if err := json.Unmarshal(b, &p); err != nil {
+			return err
+		}
+		plan = &p
+	} else {
+		p, err := assetpack.PreviewUpdate(r, *dir)
+		if err != nil {
+			return err
+		}
+		plan = p
+	}
+	if *decPath != "" {
+		b, err := os.ReadFile(*decPath)
+		if err != nil {
+			return err
+		}
+		var decisions map[string]string
+		if err := json.Unmarshal(b, &decisions); err != nil {
+			return err
+		}
+		for path, dec := range decisions {
+			if err := plan.Decide(path, dec); err != nil {
+				return err
+			}
+		}
+	}
+	if err := assetpack.ApplyUpdate(r, *dir, plan); err != nil {
+		return err
+	}
+	fmt.Println("update committed; choices recorded under .assetpack/choices.json")
+	return nil
+}
+
+func cmdRollback(args []string) error {
+	fs := flag.NewFlagSet("rollback", flag.ContinueOnError)
+	dir := fs.String("dir", "", "installation directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" {
+		return fmt.Errorf("-dir is required")
+	}
+	if err := assetpack.RollbackUpdate(*dir); err != nil {
+		return err
+	}
+	fmt.Println("rolled back; manual choices kept in .assetpack/choices.json")
+	return nil
+}
