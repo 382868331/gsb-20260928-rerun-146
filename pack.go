@@ -97,6 +97,7 @@ type AddRequest struct {
 	Path      string
 	Data      []byte
 	IsDir     bool
+	Delete    bool
 	Children  []string // IsDir 时使用, 子项逻辑路径
 	DependsOn []string
 }
@@ -144,6 +145,14 @@ func Build(reqs []AddRequest, opts Options) ([]byte, *Manifest, error) {
 			return nil, nil, fmt.Errorf("assetpack: duplicate resource path %q", reqs[i].Path)
 		}
 		seen[reqs[i].Path] = true
+		if reqs[i].Delete {
+			if opts.Base == nil {
+				return nil, nil, fmt.Errorf("assetpack: delete %q requires an incremental base", reqs[i].Path)
+			}
+			if !basePaths[reqs[i].Path] {
+				return nil, nil, fmt.Errorf("assetpack: delete %q is absent from base", reqs[i].Path)
+			}
+		}
 	}
 
 	// 片段去重表: digest -> entry
@@ -167,7 +176,9 @@ func Build(reqs []AddRequest, opts Options) ([]byte, *Manifest, error) {
 	for _, req := range reqs {
 		res := Resource{Path: req.Path, Type: "file"}
 		var body []byte
-		if req.IsDir {
+		if req.Delete {
+			res.Type = "delete"
+		} else if req.IsDir {
 			res.Type = "dir"
 			ch := append([]string(nil), req.Children...)
 			sort.Strings(ch)
@@ -181,29 +192,39 @@ func Build(reqs []AddRequest, opts Options) ([]byte, *Manifest, error) {
 			body = req.Data
 		}
 
-		res.Size = int64(len(body))
-		res.ID = hashBytes(body)
-		var refs []FragmentRef
-		for off := int64(0); off < int64(len(body)); off += fragSize {
-			end := off + fragSize
-			if end > int64(len(body)) {
-				end = int64(len(body))
+		if !req.Delete {
+			res.Size = int64(len(body))
+			res.ID = hashBytes(body)
+			var refs []FragmentRef
+			for off := int64(0); off < int64(len(body)); off += fragSize {
+				end := off + fragSize
+				if end > int64(len(body)) {
+					end = int64(len(body))
+				}
+				chunk := body[off:end]
+				d := storeFragment(chunk)
+				refs = append(refs, FragmentRef{Digest: d, Start: off, Length: int64(len(chunk))})
 			}
-			chunk := body[off:end]
-			d := storeFragment(chunk)
-			refs = append(refs, FragmentRef{Digest: d, Start: off, Length: int64(len(chunk))})
+			res.Fragments = refs
 		}
-		res.Fragments = refs
 
-		deps := dedupSortedStrings(req.DependsOn)
-		for _, dep := range deps {
-			res.DependsOn = append(res.DependsOn, cleanLogicalPath(dep))
+		if !req.Delete {
+			deps := dedupSortedStrings(req.DependsOn)
+			for _, dep := range deps {
+				res.DependsOn = append(res.DependsOn, cleanLogicalPath(dep))
+			}
 		}
 		resources = append(resources, res)
 	}
 
 	// 校验依赖指向存在的资源(本批或基础包)。
 	for _, r := range resources {
+		if r.Type == "delete" {
+			if len(r.DependsOn) != 0 {
+				return nil, nil, fmt.Errorf("assetpack: deleted resource %q cannot retain dependencies", r.Path)
+			}
+			continue
+		}
 		for _, dep := range r.DependsOn {
 			if !seen[dep] && !basePaths[dep] {
 				return nil, nil, fmt.Errorf("assetpack: resource %q depends on missing %q", r.Path, dep)

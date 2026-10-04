@@ -17,6 +17,7 @@ type SpecEntry struct {
 	File      string   `json:"file,omitempty"`
 	Inline    string   `json:"inline,omitempty"`
 	Dir       bool     `json:"dir,omitempty"`
+	Delete    bool     `json:"delete,omitempty"`
 	Children  []string `json:"children,omitempty"`
 	DependsOn []string `json:"dependsOn,omitempty"`
 }
@@ -35,7 +36,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: pack | unpack | verify")
+		return fmt.Errorf("subcommand required: pack | unpack | verify | preview | apply | resume | withdraw")
 	}
 	switch args[0] {
 	case "pack":
@@ -44,6 +45,14 @@ func run(args []string) error {
 		return cmdUnpack(args[1:])
 	case "verify":
 		return cmdVerify(args[1:])
+	case "preview":
+		return cmdPreview(args[1:])
+	case "apply":
+		return cmdApply(args[1:])
+	case "resume":
+		return cmdResume(args[1:])
+	case "withdraw":
+		return cmdWithdraw(args[1:])
 	default:
 		return fmt.Errorf("unknown subcommand %q", args[0])
 	}
@@ -95,7 +104,9 @@ func cmdPack(args []string) error {
 	reqs := make([]assetpack.AddRequest, 0, len(sf.Resources))
 	for _, e := range sf.Resources {
 		req := assetpack.AddRequest{Path: e.Path, IsDir: e.Dir, Children: e.Children, DependsOn: e.DependsOn}
-		if !e.Dir {
+		if e.Delete {
+			req.Delete = true
+		} else if !e.Dir {
 			switch {
 			case e.File != "":
 				data, err := os.ReadFile(e.File)

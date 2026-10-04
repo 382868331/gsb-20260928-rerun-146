@@ -20,6 +20,12 @@ type DepRecord struct {
 	Type      string   `json:"type"`
 	Size      int64    `json:"size"`
 	DependsOn []string `json:"dependsOn"`
+	Source    string   `json:"source,omitempty"`
+}
+
+type installedManifest struct {
+	IndexDigest string               `json:"indexDigest"`
+	Records     map[string]DepRecord `json:"records"`
 }
 
 // UnpackResult 汇总解包结果。
@@ -58,7 +64,16 @@ func inRootName(logical string) (string, error) {
 }
 
 func validateResources(records []Resource) ([]Resource, error) {
-	out := append([]Resource(nil), records...)
+	out := make([]Resource, 0, len(records))
+	for _, res := range records {
+		if res.Type == "delete" {
+			if _, err := inRootName(res.Path); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		out = append(out, res)
+	}
 	sortResources(out)
 	seen := make(map[string]bool, len(out))
 	files := make(map[string]bool, len(out))
@@ -198,6 +213,7 @@ func Unpack(r *Reader, root string) (*UnpackResult, error) {
 			Type:      res.Type,
 			Size:      res.Size,
 			DependsOn: append([]string(nil), res.DependsOn...),
+			Source:    SourceOriginal,
 		}
 	}
 
@@ -238,11 +254,7 @@ func Unpack(r *Reader, root string) (*UnpackResult, error) {
 	}
 
 	// 阶段四: 原子发布索引(身份 + 引用关系, 含循环依赖)。包内容未全部核对前不写它。
-	meta := struct {
-		IndexDigest string               `json:"indexDigest"`
-		Records     map[string]DepRecord `json:"records"`
-	}{m.IndexDigest, records}
-	mb, err := json.MarshalIndent(meta, "", "  ")
+	mb, err := json.MarshalIndent(installedManifest{IndexDigest: m.IndexDigest, Records: records}, "", "  ")
 	if err != nil {
 		return nil, err
 	}

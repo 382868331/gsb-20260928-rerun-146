@@ -22,6 +22,7 @@ type Reader struct {
 	ra        io.ReaderAt
 	size      int64
 	merged    *Manifest
+	tip       *Manifest
 	fragIndex map[string]fragLoc
 	base      *Reader
 }
@@ -182,8 +183,18 @@ func (r *Reader) parse() error {
 	}
 
 	r.merged = &m
+	r.tip = cloneManifest(&m)
 	r.fragIndex = idx
 	return nil
+}
+
+func cloneManifest(m *Manifest) *Manifest {
+	if m == nil {
+		return nil
+	}
+	out := *m
+	out.Resources = append([]Resource(nil), m.Resources...)
+	return &out
 }
 
 // Manifest 返回(已合并包链后的)完整清单副本。
@@ -266,6 +277,7 @@ func (m *Manifest) Records() []Resource {
 // mergeManifests 以 cur 覆盖 base 中同路径资源, 产出新版本完整清单。
 func mergeManifests(base, cur *Manifest) *Manifest {
 	byPath := map[string]Resource{}
+	deleted := map[string]bool{}
 	var order []string
 	for _, res := range base.Resources {
 		if _, ok := byPath[res.Path]; !ok {
@@ -274,6 +286,10 @@ func mergeManifests(base, cur *Manifest) *Manifest {
 		byPath[res.Path] = res
 	}
 	for _, res := range cur.Resources {
+		if res.Type == "delete" {
+			deleted[res.Path] = true
+			continue
+		}
 		if _, ok := byPath[res.Path]; !ok {
 			order = append(order, res.Path)
 		}
@@ -287,6 +303,9 @@ func mergeManifests(base, cur *Manifest) *Manifest {
 		IndexDigest:  cur.IndexDigest,
 	}
 	for _, p := range order {
+		if deleted[p] {
+			continue
+		}
 		out.Resources = append(out.Resources, byPath[p])
 	}
 	return out

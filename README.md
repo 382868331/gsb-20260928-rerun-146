@@ -16,6 +16,9 @@
 - **嵌套资源**：目录作为合成资源保存稳定的子项清单（排序、确定性）。
 - **增量发布**：增量包记录 `baseIndex`（上一版索引身份），内容身份不变的片段不重复保存，
   按 `base -> delta...` 组成包链读取合并视图；离开基础包无法单独打开增量包。
+- **安全更新预览**：应用到已有安装时先核对安装索引与增量基准，分类为可直接替换、本地已改动和包内删除；本地改动默认保留，必须显式选择才会采用包内容或删除。
+- **可续作与撤回**：采用前重新核对预览依据；采用时先暂存包内容和备份，逐项提交进度，最后发布索引，中断后可续作。完成的更新可撤回并保留人工选择记录。
+- **来源清单**：最终 `.assetpack/manifest.json` 标明每个资源来自原安装（`original`）、本地保留（`local`）或此次更新（`update`）。
 - **确定性**：固定输入（含片段大小）产出字节一致的包与稳定索引摘要；不含时间戳。
 
 ## 包格式 (v1, 大端序)
@@ -41,6 +44,12 @@ assetpack unpack -pkg base.pkg -dir out/
 assetpack pack -spec delta.json -base base.pkg -out delta.pkg
 assetpack verify -base base.pkg -pkg delta.pkg
 assetpack unpack -base base.pkg -pkg delta.pkg -dir out2/
+
+# 更新已有安装: 先预览, 再显式采用
+assetpack preview -base base.pkg -pkg delta.pkg -dir installed/ -out preview.json
+assetpack apply -base base.pkg -pkg delta.pkg -dir installed/ -preview preview.json -choices choices.json
+assetpack resume -base base.pkg -pkg delta.pkg -dir installed/
+assetpack withdraw -dir installed/
 ```
 
 spec JSON 示例：
@@ -51,8 +60,22 @@ spec JSON 示例：
   "resources": [
     {"path": "scenes/a.json", "file": "a.json", "dependsOn": ["scenes/b.json"]},
     {"path": "scenes/b.json", "inline": "{}", "dependsOn": ["scenes/a.json"]},
-    {"path": "scenes", "dir": true, "children": ["scenes/a.json", "scenes/b.json"]}
+    {"path": "scenes", "dir": true, "children": ["scenes/a.json", "scenes/b.json"]},
+    {"path": "obsolete.tmp", "delete": true}
   ]
+}
+```
+
+`choices.json` 只覆盖需要改变默认值的资源。未列出的本地已改动资源继续保留，未改动的
+替换或删除可直接按包执行；每个预览项都包含 `referencedBy` 与 `impact`，说明保留、采用
+或删除会让其他资源引用解析到本地身份还是更新身份：
+
+```json
+{
+  "choices": {
+    "scenes/a.json": "package",
+    "obsolete.tmp": "keep"
+  }
 }
 ```
 
@@ -62,6 +85,9 @@ spec JSON 示例：
 - `OpenReaderAt(ra, size)` / `OpenChain([]ReaderAtSize)`
 - `(*Reader).ReadResource(path)` / `VerifyAll()` / `Manifest()`
 - `Unpack(reader, rootDir)`
+- `PreviewUpdate(reader, rootDir)` / `DecideUpdate(preview, choices)`
+- `ApplyUpdate(reader, rootDir, preview)` / `ApplyPrepared(rootDir)` / `ResumeUpdate(reader, rootDir)`
+- `WithdrawUpdate(rootDir)`
 - `WriteFileAtomic(path, data, perm)`
 
 ## 测试
@@ -72,3 +98,5 @@ go test ./...
 
 覆盖：共享去重、循环依赖恢复、嵌套目录、确定性、损坏片段按需检测、
 真实路径/符号链接越界拒绝、重复资源拒绝、未完成不发布索引、增量身份复用与包链合并、截断/尾部篡改。
+更新测试额外覆盖：增量包与本地修改冲突、包删除、预览依据变化后必须重新决定、采用中断后
+续作、撤回恢复人工保留内容，以及预览/采用/撤回各阶段的路径边界检查。
