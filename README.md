@@ -17,6 +17,9 @@
 - **增量发布**：增量包记录 `baseIndex`（上一版索引身份），内容身份不变的片段不重复保存，
   按 `base -> delta...` 组成包链读取合并视图；离开基础包无法单独打开增量包。
 - **安全更新预览**：应用到已有安装时先核对安装索引与增量基准，分类为可直接替换、新增、用户已删除、本地已改动和包内删除；本地改动默认保留，新增与用户删除默认采用包内容，默认选择始终对应真实存在的内容，必须显式选择才会改变本地已改动资源的去留。
+- **引用预演清单**：预览同时给出 `rehearsal`，按引用关系列出每个资源的依赖在采用当前选择后最终解析到包内（`update`）、本地保留（`local`）还是缺失（`missing`）；仍指向包内已删除资源的引用列入 `dangling`，并通过 `choicePath` 给出明确处理入口（对该路径选择 `keep` 即保留本地内容，选择 `package` 即接受引用缺失）。
+- **人工选择理由**：`choices.json` 可附带 `reasons`，理由随更新回执持久保存；撤回后仍可通过 `decisions` 子命令或 `ListUpdateHistory` 查阅此次决定。
+- **部分重新核对**：预演后本地内容再变化时，`PrepareUpdate` 返回 `RecheckNeeded` 列出受影响路径；`RevalidatePreview` 只重置这些项的选择与理由，其余人工选择保持不变。
 - **可续作与撤回**：采用前重新核对预览依据；采用时先暂存包内容和备份，逐项提交进度，最后发布索引，中断后可续作。完成的更新可撤回并保留人工选择记录。
 - **来源清单**：最终 `.assetpack/manifest.json` 标明每个资源来自原安装（`original`）、本地保留（`local`）或此次更新（`update`）。
 - **确定性**：固定输入（含片段大小）产出字节一致的包与稳定索引摘要；不含时间戳。
@@ -50,6 +53,7 @@ assetpack preview -base base.pkg -pkg delta.pkg -dir installed/ -out preview.jso
 assetpack apply -base base.pkg -pkg delta.pkg -dir installed/ -preview preview.json -choices choices.json
 assetpack resume -base base.pkg -pkg delta.pkg -dir installed/
 assetpack withdraw -dir installed/
+assetpack decisions -dir installed/
 ```
 
 spec JSON 示例：
@@ -66,7 +70,7 @@ spec JSON 示例：
 }
 ```
 
-`choices.json` 只覆盖需要改变默认值的资源。未列出的本地已改动资源继续保留，未改动的
+`choices.json` 只覆盖需要改变默认值的资源，`reasons` 为对应选择记录人工理由。未列出的本地已改动资源继续保留，未改动的
 替换或删除可直接按包执行；每个预览项都包含 `referencedBy` 与 `impact`，说明保留、采用
 或删除会让其他资源引用解析到本地身份还是更新身份：
 
@@ -75,6 +79,9 @@ spec JSON 示例：
   "choices": {
     "scenes/a.json": "package",
     "obsolete.tmp": "keep"
+  },
+  "reasons": {
+    "obsolete.tmp": "scenes/a.json 仍引用它, 保留本地内容"
   }
 }
 ```
@@ -85,7 +92,8 @@ spec JSON 示例：
 - `OpenReaderAt(ra, size)` / `OpenChain([]ReaderAtSize)`
 - `(*Reader).ReadResource(path)` / `VerifyAll()` / `Manifest()`
 - `Unpack(reader, rootDir)`
-- `PreviewUpdate(reader, rootDir)` / `DecideUpdate(preview, choices)`
+- `PreviewUpdate(reader, rootDir)` / `DecideUpdate(preview, choices)` / `DecideUpdateWithReasons(preview, choices, reasons)`
+- `RevalidatePreview(preview, rootDir)` / `RecheckNeeded` / `ListUpdateHistory(rootDir)`
 - `ApplyUpdate(reader, rootDir, preview)` / `ApplyPrepared(rootDir)` / `ResumeUpdate(reader, rootDir)`
 - `WithdrawUpdate(rootDir)`
 - `WriteFileAtomic(path, data, perm)`

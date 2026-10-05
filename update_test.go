@@ -358,3 +358,150 @@ func TestUpdateAddedUserDeletedClassification(t *testing.T) {
 		t.Fatalf("re-applied new resource mismatch: %q", got)
 	}
 }
+
+func TestUpdateRehearsalRecheckAndHistory(t *testing.T) {
+	basePkg, baseM, err := Build([]AddRequest{
+		{Path: "dep.txt", Data: []byte("dep-v1")},
+		{Path: "gone.txt", Data: []byte("gone")},
+		{Path: "user.txt", Data: []byte("user"), DependsOn: []string{"dep.txt", "gone.txt"}},
+	}, Options{FragmentSize: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseReader := readerFromPackage(t, basePkg)
+	deltaPkg, _, err := Build([]AddRequest{
+		{Path: "dep.txt", Data: []byte("dep-v2")},
+		{Path: "gone.txt", Delete: true},
+		{Path: "new.txt", Data: []byte("new"), DependsOn: []string{"dep.txt", "gone.txt"}},
+	}, Options{FragmentSize: 1024, Base: baseM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := OpenChain([]ReaderAtSize{bytes.NewReader(basePkg), bytes.NewReader(deltaPkg)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "install")
+	if _, err := Unpack(baseReader, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dep.txt"), []byte("dep-local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pv, err := PreviewUpdate(chain, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution := func(path, dep string) DepResolution {
+		t.Helper()
+		for _, entry := range pv.Rehearsal {
+			if entry.Path != path {
+				continue
+			}
+			for _, d := range entry.Deps {
+				if d.Path == dep {
+					return d
+				}
+			}
+		}
+		t.Fatalf("missing rehearsal entry %s -> %s", path, dep)
+		return DepResolution{}
+	}
+	if got := resolution("new.txt", "dep.txt"); got.Source != SourceLocal {
+		t.Fatalf("new.txt dep on locally kept dep.txt must resolve local, got %+v", got)
+	}
+	if got := resolution("new.txt", "gone.txt"); got.Source != SourceMissing {
+		t.Fatalf("new.txt dep on deleted gone.txt must resolve missing, got %+v", got)
+	}
+	if got := resolution("user.txt", "dep.txt"); got.Source != SourceLocal {
+		t.Fatalf("user.txt dep resolution changed unexpectedly: %+v", got)
+	}
+	var dangling *DanglingRef
+	for i := range pv.Dangling {
+		if pv.Dangling[i].Referrer == "new.txt" && pv.Dangling[i].Target == "gone.txt" {
+			dangling = &pv.Dangling[i]
+		}
+	}
+	if dangling == nil || dangling.Handling != "accept-missing" || dangling.ChoicePath != "gone.txt" {
+		t.Fatalf("dangling reference must offer a handling entry: %+v", pv.Dangling)
+	}
+
+	if err := DecideUpdateWithReasons(pv, map[string]UpdateChoice{
+		"gone.txt": ChoiceKeep,
+	}, map[string]string{
+		"gone.txt": "new.txt still references it; keep local content",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolution("new.txt", "gone.txt"); got.Source != SourceLocal {
+		t.Fatalf("keeping gone.txt must re-resolve new.txt dep to local, got %+v", got)
+	}
+	for _, d := range pv.Dangling {
+		if d.Target == "gone.txt" && d.Handling != "keep-local" {
+			t.Fatalf("dangling handling must follow the keep choice: %+v", d)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "dep.txt"), []byte("dep-local-v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = PrepareUpdate(chain, dir, pv)
+	var recheck *RecheckNeeded
+	if !errors.As(err, &recheck) || !errors.Is(err, ErrPreviewChanged) {
+		t.Fatalf("expected RecheckNeeded, got %v", err)
+	}
+	if len(recheck.Paths) != 1 || recheck.Paths[0] != "dep.txt" {
+		t.Fatalf("only dep.txt must need re-decision, got %v", recheck.Paths)
+	}
+	changed, err := RevalidatePreview(pv, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 1 || changed[0] != "dep.txt" {
+		t.Fatalf("revalidate must only touch dep.txt, got %v", changed)
+	}
+	if pv.Choices["gone.txt"] != ChoiceKeep || pv.Reasons["gone.txt"] == "" {
+		t.Fatalf("unrelated choice and reason must survive revalidation: %+v", pv.Choices)
+	}
+	if err := ApplyUpdate(chain, dir, pv); err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := ListUpdateHistory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].Withdrawn {
+		t.Fatalf("expected one active history entry, got %+v", history)
+	}
+	var kept *UpdateDecision
+	for i := range history[0].Decisions {
+		if history[0].Decisions[i].Path == "gone.txt" {
+			kept = &history[0].Decisions[i]
+		}
+	}
+	if kept == nil || kept.Choice != ChoiceKeep || kept.Reason == "" {
+		t.Fatalf("decision with reason must be recorded: %+v", history[0].Decisions)
+	}
+
+	if err := WithdrawUpdate(dir); err != nil {
+		t.Fatal(err)
+	}
+	history, err = ListUpdateHistory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || !history[0].Withdrawn {
+		t.Fatalf("withdrawn update must remain listed, got %+v", history)
+	}
+	found := false
+	for _, d := range history[0].Decisions {
+		if d.Path == "gone.txt" && d.Reason != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("decision reasons must remain queryable after withdrawal")
+	}
+}

@@ -36,7 +36,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: pack | unpack | verify | preview | apply | resume | withdraw")
+		return fmt.Errorf("subcommand required: pack | unpack | verify | preview | apply | resume | withdraw | decisions")
 	}
 	switch args[0] {
 	case "pack":
@@ -53,6 +53,8 @@ func run(args []string) error {
 		return cmdResume(args[1:])
 	case "withdraw":
 		return cmdWithdraw(args[1:])
+	case "decisions":
+		return cmdDecisions(args[1:])
 	default:
 		return fmt.Errorf("unknown subcommand %q", args[0])
 	}

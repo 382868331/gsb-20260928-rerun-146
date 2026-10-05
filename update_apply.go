@@ -115,6 +115,7 @@ func PrepareUpdate(r *Reader, rootDir string, pv *UpdatePreview) error {
 		}
 	}()
 
+	var stale []string
 	for _, item := range pv.Items {
 		name, err := inRootName(item.Path)
 		if err != nil {
@@ -125,11 +126,15 @@ func PrepareUpdate(r *Reader, rootDir string, pv *UpdatePreview) error {
 			return err
 		}
 		if got != item.LocalID {
-			return fmt.Errorf("%w: %q", ErrPreviewChanged, item.Path)
+			stale = append(stale, item.Path)
+			continue
 		}
 		if item.Choice == ChoiceKeep && item.LocalID == "" {
 			return fmt.Errorf("%w: cannot keep %q: no local content exists", ErrCorrupt, item.Path)
 		}
+	}
+	if len(stale) > 0 {
+		return &RecheckNeeded{Paths: stale}
 	}
 
 	mergedByPath := map[string]Resource{}
@@ -343,7 +348,7 @@ func ApplyPrepared(rootDir string) error {
 	if err != nil {
 		return err
 	}
-	receipt := updateReceipt{InstalledIndex: state.InstalledIndex, PackageIndex: packageToken, Choices: state.Preview.Choices, Operations: state.Operations, Previous: previous}
+	receipt := updateReceipt{InstalledIndex: state.InstalledIndex, PackageIndex: packageToken, Choices: state.Preview.Choices, Decisions: previewDecisions(&state.Preview), Operations: state.Operations, Previous: previous}
 	historyName := filepath.Join(historyIndexDir(), packageToken[:12]+".json")
 	if err := writeJSONInRoot(root, historyName, &receipt); err != nil {
 		return err
@@ -372,6 +377,67 @@ func ApplyUpdate(r *Reader, rootDir string, pv *UpdatePreview) error {
 		return err
 	}
 	return ApplyPrepared(rootDir)
+}
+
+func previewDecisions(pv *UpdatePreview) []UpdateDecision {
+	paths := make([]string, 0, len(pv.Choices))
+	for p := range pv.Choices {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	out := make([]UpdateDecision, 0, len(paths))
+	for _, p := range paths {
+		out = append(out, UpdateDecision{Path: p, Choice: pv.Choices[p], Reason: pv.Reasons[p]})
+	}
+	return out
+}
+
+// ListUpdateHistory 返回全部已完成更新的决定记录(含已撤回的), 最新的在最后。
+func ListUpdateHistory(rootDir string) ([]UpdateHistoryEntry, error) {
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	historyRoot, err := root.Open(historyIndexDir())
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer historyRoot.Close()
+	entries, err := historyRoot.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0)
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		base, err := safeReceiptName(ent.Name())
+		if err != nil {
+			continue
+		}
+		names = append(names, base)
+	}
+	sort.Strings(names)
+	out := make([]UpdateHistoryEntry, 0, len(names))
+	for _, base := range names {
+		var receipt updateReceipt
+		if err := readJSONInRoot(root, filepath.Join(historyIndexDir(), base), &receipt); err != nil {
+			return nil, err
+		}
+		out = append(out, UpdateHistoryEntry{
+			Receipt:        base,
+			InstalledIndex: receipt.InstalledIndex,
+			PackageIndex:   receipt.PackageIndex,
+			Withdrawn:      receipt.Withdrawn,
+			Decisions:      receipt.Decisions,
+		})
+	}
+	return out, nil
 }
 
 func ResumeUpdate(r *Reader, rootDir string) error {

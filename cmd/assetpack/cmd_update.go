@@ -11,21 +11,22 @@ import (
 
 type choiceFile struct {
 	Choices map[string]assetpack.UpdateChoice `json:"choices"`
+	Reasons map[string]string                 `json:"reasons"`
 }
 
-func loadChoices(path string) (map[string]assetpack.UpdateChoice, error) {
+func loadChoices(path string) (map[string]assetpack.UpdateChoice, map[string]string, error) {
 	if path == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var cf choiceFile
 	if err := json.Unmarshal(b, &cf); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return cf.Choices, nil
+	return cf.Choices, cf.Reasons, nil
 }
 
 func cmdPreview(args []string) error {
@@ -86,11 +87,11 @@ func cmdApply(args []string) error {
 	if err := json.Unmarshal(b, &pv); err != nil {
 		return err
 	}
-	choices, err := loadChoices(*choicePath)
+	choices, reasons, err := loadChoices(*choicePath)
 	if err != nil {
 		return err
 	}
-	if err := assetpack.DecideUpdate(&pv, choices); err != nil {
+	if err := assetpack.DecideUpdateWithReasons(&pv, choices, reasons); err != nil {
 		return err
 	}
 	if err := assetpack.ApplyUpdate(r, *dir, &pv); err != nil {
@@ -137,4 +138,25 @@ func cmdWithdraw(args []string) error {
 	}
 	fmt.Printf("latest update withdrawn from %s; human choices remain recorded\n", *dir)
 	return nil
+}
+
+func cmdDecisions(args []string) error {
+	fs := flag.NewFlagSet("decisions", flag.ContinueOnError)
+	dir := fs.String("dir", "", "installed directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" {
+		return fmt.Errorf("-dir is required")
+	}
+	history, err := assetpack.ListUpdateHistory(*dir)
+	if err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(history, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = os.Stdout.Write(append(b, '\n'))
+	return err
 }

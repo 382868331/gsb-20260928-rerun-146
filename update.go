@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 const (
 	SourceOriginal = "original"
 	SourceLocal    = "local"
 	SourceUpdate   = "update"
+	SourceMissing  = "missing"
 )
 
 const (
@@ -57,10 +59,32 @@ type UpdateItem struct {
 	InstalledID   string       `json:"installedId,omitempty"`
 	LocalID       string       `json:"localId,omitempty"`
 	PackageID     string       `json:"packageId,omitempty"`
+	PackageDelete bool         `json:"packageDelete,omitempty"`
 	DefaultChoice UpdateChoice `json:"defaultChoice"`
 	Choice        UpdateChoice `json:"choice"`
 	ReferencedBy  []string     `json:"referencedBy,omitempty"`
 	Impact        string       `json:"impact"`
+}
+
+// DepResolution 说明某个引用在采用当前选择后最终解析到哪一份内容。
+type DepResolution struct {
+	Path   string `json:"path"`
+	Source string `json:"source"` // update | local | missing
+	ID     string `json:"id,omitempty"`
+}
+
+// RehearsalItem 按引用关系列出单个资源的每个依赖的采用结果。
+type RehearsalItem struct {
+	Path string          `json:"path"`
+	Deps []DepResolution `json:"deps"`
+}
+
+// DanglingRef 是仍指向包内已删除资源的引用; ChoicePath 给出处理入口(对该路径做选择)。
+type DanglingRef struct {
+	Referrer   string `json:"referrer"`
+	Target     string `json:"target"`
+	ChoicePath string `json:"choicePath"`
+	Handling   string `json:"handling"` // keep-local | accept-missing
 }
 
 type UpdatePreview struct {
@@ -68,6 +92,11 @@ type UpdatePreview struct {
 	PackageIndex   string                  `json:"packageIndex"`
 	Items          []UpdateItem            `json:"items"`
 	Choices        map[string]UpdateChoice `json:"choices"`
+	Reasons        map[string]string       `json:"reasons,omitempty"`
+	Depends        map[string][]string     `json:"depends,omitempty"`
+	MergedIDs      map[string]string       `json:"mergedIds,omitempty"`
+	Rehearsal      []RehearsalItem         `json:"rehearsal,omitempty"`
+	Dangling       []DanglingRef           `json:"dangling,omitempty"`
 }
 
 type pendingOperation struct {
@@ -95,9 +124,26 @@ type updateReceipt struct {
 	InstalledIndex string                  `json:"installedIndex"`
 	PackageIndex   string                  `json:"packageIndex"`
 	Choices        map[string]UpdateChoice `json:"choices"`
+	Decisions      []UpdateDecision        `json:"decisions,omitempty"`
 	Operations     []pendingOperation      `json:"operations"`
 	Previous       []byte                  `json:"previousManifest"`
 	Withdrawn      bool                    `json:"withdrawn,omitempty"`
+}
+
+// UpdateDecision 记录一次人工选择及其理由, 随更新回执持久保存。
+type UpdateDecision struct {
+	Path   string       `json:"path"`
+	Choice UpdateChoice `json:"choice"`
+	Reason string       `json:"reason,omitempty"`
+}
+
+// UpdateHistoryEntry 是已完成(含已撤回)更新的可查阅决定记录。
+type UpdateHistoryEntry struct {
+	Receipt        string           `json:"receipt"`
+	InstalledIndex string           `json:"installedIndex"`
+	PackageIndex   string           `json:"packageIndex"`
+	Withdrawn      bool             `json:"withdrawn"`
+	Decisions      []UpdateDecision `json:"decisions,omitempty"`
 }
 
 func (r *Reader) TipManifest() Manifest { return *cloneManifest(r.tip) }
@@ -201,7 +247,27 @@ func PreviewUpdate(r *Reader, rootDir string) (*UpdatePreview, error) {
 		addRef(p, rec.DependsOn)
 	}
 
+	depends := map[string][]string{}
+	mergedIDs := map[string]string{}
+	for _, rec := range r.merged.Records() {
+		mergedIDs[rec.Path] = rec.ID
+		if len(rec.DependsOn) > 0 {
+			depends[rec.Path] = dedupSortedStrings(rec.DependsOn)
+		}
+	}
+	for p, rec := range installed {
+		if _, ok := depends[p]; !ok && len(rec.DependsOn) > 0 {
+			depends[p] = dedupSortedStrings(rec.DependsOn)
+		}
+	}
+
 	pv := &UpdatePreview{InstalledIndex: inst.IndexDigest, PackageIndex: tip.IndexDigest, Choices: map[string]UpdateChoice{}}
+	if len(depends) > 0 {
+		pv.Depends = depends
+	}
+	if len(mergedIDs) > 0 {
+		pv.MergedIDs = mergedIDs
+	}
 	for _, change := range tip.Records() {
 		name, err := inRootName(change.Path)
 		if err != nil {
@@ -222,7 +288,7 @@ func PreviewUpdate(r *Reader, rootDir string) (*UpdatePreview, error) {
 				status = PreviewLocal
 				choice = ChoiceKeep
 			}
-			item := UpdateItem{Path: change.Path, Status: status, Kind: old.Type, InstalledID: old.ID, LocalID: localID, DefaultChoice: choice, Choice: choice, ReferencedBy: dedupSortedStrings(referrers[change.Path])}
+			item := UpdateItem{Path: change.Path, Status: status, Kind: old.Type, InstalledID: old.ID, LocalID: localID, PackageDelete: true, DefaultChoice: choice, Choice: choice, ReferencedBy: dedupSortedStrings(referrers[change.Path])}
 			item.Impact = impactText(item, true)
 			pv.Items = append(pv.Items, item)
 			pv.Choices[item.Path] = item.Choice
@@ -258,7 +324,61 @@ func PreviewUpdate(r *Reader, rootDir string) (*UpdatePreview, error) {
 		pv.Choices[item.Path] = item.Choice
 	}
 	sort.Slice(pv.Items, func(i, j int) bool { return pv.Items[i].Path < pv.Items[j].Path })
+	pv.refreshDerived()
 	return pv, nil
+}
+
+// resolveDep 计算依赖路径在当前选择下的最终内容来源。
+func (pv *UpdatePreview) resolveDep(dep string) DepResolution {
+	for i := range pv.Items {
+		item := &pv.Items[i]
+		if item.Path != dep {
+			continue
+		}
+		if item.Choice == ChoiceKeep {
+			return DepResolution{Path: dep, Source: SourceLocal, ID: item.LocalID}
+		}
+		if item.PackageDelete {
+			return DepResolution{Path: dep, Source: SourceMissing}
+		}
+		return DepResolution{Path: dep, Source: SourceUpdate, ID: item.PackageID}
+	}
+	if id, ok := pv.MergedIDs[dep]; ok {
+		return DepResolution{Path: dep, Source: SourceUpdate, ID: id}
+	}
+	return DepResolution{Path: dep, Source: SourceMissing}
+}
+
+// refreshDerived 依据当前选择重算预演清单与悬空引用处理入口。
+func (pv *UpdatePreview) refreshDerived() {
+	paths := make([]string, 0, len(pv.Depends))
+	for p := range pv.Depends {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	pv.Rehearsal = nil
+	pv.Dangling = nil
+	for _, p := range paths {
+		deps := pv.Depends[p]
+		entry := RehearsalItem{Path: p, Deps: make([]DepResolution, 0, len(deps))}
+		for _, dep := range deps {
+			entry.Deps = append(entry.Deps, pv.resolveDep(dep))
+		}
+		pv.Rehearsal = append(pv.Rehearsal, entry)
+		for _, dep := range deps {
+			for i := range pv.Items {
+				item := &pv.Items[i]
+				if item.Path != dep || !item.PackageDelete {
+					continue
+				}
+				handling := "accept-missing"
+				if item.Choice == ChoiceKeep {
+					handling = "keep-local"
+				}
+				pv.Dangling = append(pv.Dangling, DanglingRef{Referrer: p, Target: dep, ChoicePath: dep, Handling: handling})
+			}
+		}
+	}
 }
 
 func impactText(item UpdateItem, deleted bool) string {
@@ -276,10 +396,16 @@ func impactText(item UpdateItem, deleted bool) string {
 }
 
 func DecideUpdate(pv *UpdatePreview, choices map[string]UpdateChoice) error {
+	return DecideUpdateWithReasons(pv, choices, nil)
+}
+
+// DecideUpdateWithReasons 应用人工选择并保存每个选择的理由; 选择变化后重算预演清单。
+func DecideUpdateWithReasons(pv *UpdatePreview, choices map[string]UpdateChoice, reasons map[string]string) error {
 	by := map[string]*UpdateItem{}
 	for i := range pv.Items {
 		by[pv.Items[i].Path] = &pv.Items[i]
 	}
+	decided := false
 	for path, choice := range choices {
 		name, err := inRootName(path)
 		if err != nil {
@@ -299,6 +425,91 @@ func DecideUpdate(pv *UpdatePreview, choices map[string]UpdateChoice) error {
 		item.Choice = choice
 		pv.Choices[path] = choice
 		item.Impact = impactText(*item, item.Status == PreviewRemoved)
+		decided = true
+	}
+	for path, reason := range reasons {
+		if _, ok := by[path]; !ok {
+			return fmt.Errorf("assetpack: reason for unknown preview resource %q", path)
+		}
+		if reason == "" {
+			continue
+		}
+		if pv.Reasons == nil {
+			pv.Reasons = map[string]string{}
+		}
+		pv.Reasons[path] = reason
+	}
+	if decided || len(pv.Reasons) > 0 {
+		pv.refreshDerived()
 	}
 	return nil
+}
+
+// RecheckNeeded 表示预演后部分资源的本地内容发生变化, 只有这些选择需要重新核对。
+type RecheckNeeded struct {
+	Paths []string
+}
+
+func (e *RecheckNeeded) Error() string {
+	return fmt.Sprintf("%v: re-decide affected choice(s): %s", ErrPreviewChanged, strings.Join(e.Paths, ", "))
+}
+
+func (e *RecheckNeeded) Unwrap() error { return ErrPreviewChanged }
+
+// RevalidatePreview 在预演依据变化后只重新核对受影响的项: 刷新其本地身份与默认选择,
+// 清除这些项的人工选择与理由, 其余选择保持不变。返回需要重新决定的路径。
+func RevalidatePreview(pv *UpdatePreview, rootDir string) ([]string, error) {
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	var changed []string
+	for i := range pv.Items {
+		item := &pv.Items[i]
+		name, err := inRootName(item.Path)
+		if err != nil {
+			return nil, err
+		}
+		got, err := localIdentity(root, item.Path, name, item.Kind)
+		if err != nil {
+			return nil, err
+		}
+		if got == item.LocalID {
+			continue
+		}
+		item.LocalID = got
+		hadOld := item.InstalledID != ""
+		choice := ChoicePackage
+		switch {
+		case item.PackageDelete:
+			if got != "" && got != item.InstalledID {
+				item.Status = PreviewLocal
+				choice = ChoiceKeep
+			} else {
+				item.Status = PreviewRemoved
+			}
+		case !hadOld && (got == "" || got == item.PackageID):
+			item.Status = PreviewAdded
+		case hadOld && got == "":
+			item.Status = PreviewUserDeleted
+		case got == item.PackageID || (hadOld && got == item.InstalledID):
+			item.Status = PreviewDirect
+		default:
+			item.Status = PreviewLocal
+			choice = ChoiceKeep
+		}
+		item.DefaultChoice = choice
+		item.Choice = choice
+		item.Impact = impactText(*item, item.PackageDelete)
+		pv.Choices[item.Path] = choice
+		if pv.Reasons != nil {
+			delete(pv.Reasons, item.Path)
+		}
+		changed = append(changed, item.Path)
+	}
+	if len(changed) > 0 {
+		pv.refreshDerived()
+	}
+	return changed, nil
 }
